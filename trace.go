@@ -1,0 +1,252 @@
+//
+// Copyright (c) 2015-2024 MinIO, Inc.
+//
+// This file is part of MinIO Object Storage stack
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as
+// published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program. If not, see <http://www.gnu.org/licenses/>.
+//
+
+package madmin
+
+import (
+	"math/bits"
+	"net/http"
+	"strings"
+	"time"
+)
+
+//go:generate go tool stringer -type=TraceType -trimprefix=Trace $GOFILE
+
+// TraceType indicates the type of the tracing Info
+type TraceType uint64
+
+const (
+	// TraceOS tracing (Golang os package calls)
+	TraceOS TraceType = 1 << iota
+	// TraceStorage tracing (MinIO Storage Layer)
+	TraceStorage
+	// TraceS3 provides tracing of S3 API calls
+	TraceS3
+	// TraceInternal tracing internal (.minio.sys/...) HTTP calls
+	TraceInternal
+	// TraceScanner will trace scan operations.
+	TraceScanner
+	// TraceDecommission will trace decommission operations.
+	TraceDecommission
+	// TraceHealing will trace healing operations.
+	TraceHealing
+	// TraceBatchReplication will trace batch replication operations.
+	TraceBatchReplication
+	// TraceBatchKeyRotation will trace batch keyrotation operations.
+	TraceBatchKeyRotation
+	// TraceBatchExpire will trace batch expiration operations.
+	TraceBatchExpire
+	// TraceRebalance will trace rebalance operations
+	TraceRebalance
+	// TraceReplicationResync will trace replication resync operations.
+	TraceReplicationResync
+	// TraceBootstrap will trace events during MinIO cluster bootstrap
+	TraceBootstrap
+	// TraceFTP will trace events from MinIO FTP Server
+	TraceFTP
+	// TraceILM will trace events during MinIO ILM operations
+	TraceILM
+	// TraceKMS are traces for interactions with KMS.
+	TraceKMS
+	// TraceFormatting will trace formatting events
+	TraceFormatting
+	// TraceAdmin will trace admin calls
+	TraceAdmin
+	// TraceObject will trade object layer operations
+	TraceObject
+	// TraceReplication will trace replication as they are being picked up by workers
+	TraceReplication
+	// TraceIAM will trace Identity and Access Management
+	TraceIAM
+	// TraceTables will trace table operations
+	TraceTables
+	// TracePurgeOnDelete will trace purge-on-delete operations
+	TracePurgeOnDelete
+	// TraceTablesScan will trace catalog scanner operations which are for replica catalog rebuilding.
+	TraceTablesScan
+	// TraceSystemInventory will trace per-bucket system inventory operations.
+	TraceSystemInventory
+	// TraceTablesCompaction will trace table compaction operations.
+	TraceTablesCompaction
+	// TraceMemory will trace the AIStor Memory API functions.
+	TraceMemory
+	// TraceFiles will trace the operations of the AIStor Files gateway on each node.
+	TraceFiles
+	// Add more here...
+
+	// TraceAll contains all valid trace modes.
+	// This *must* be the last entry.
+	TraceAll TraceType = (1 << iota) - 1
+)
+
+const (
+	// TraceBatch will trace all batch operations.
+	TraceBatch = TraceBatchReplication | TraceBatchKeyRotation | TraceBatchExpire // |TraceBatch<NextFeature>
+)
+
+// FindTraceType will find a single trace type from a string,
+// as returned by String(). Matching is not case sensitive.
+// Will return 0 if not found.
+func FindTraceType(s string) TraceType {
+	bitIdx := uint(0)
+	for {
+		idx := TraceType(1 << bitIdx)
+		if idx > TraceAll {
+			return 0
+		}
+		if strings.EqualFold(idx.String(), s) {
+			return idx
+		}
+		bitIdx++
+	}
+}
+
+// Contains returns whether all flags in other is present in t.
+func (t TraceType) Contains(other TraceType) bool {
+	return t&other == other
+}
+
+// Overlaps returns whether any flags in t overlaps with other.
+func (t TraceType) Overlaps(other TraceType) bool {
+	return t&other != 0
+}
+
+// SingleType returns whether t has a single type set.
+func (t TraceType) SingleType() bool {
+	// Include
+	return bits.OnesCount64(uint64(t)) == 1
+}
+
+// Merge will merge other into t.
+func (t *TraceType) Merge(other TraceType) {
+	*t = *t | other
+}
+
+// SetIf will add other if b is true.
+func (t *TraceType) SetIf(b bool, other TraceType) {
+	if b {
+		*t = *t | other
+	}
+}
+
+// Mask returns the trace type as uint32.
+func (t TraceType) Mask() uint64 {
+	return uint64(t)
+}
+
+// TraceInfo - represents a trace record, additionally
+// also reports errors if any while listening on trace.
+type TraceInfo struct {
+	TraceType TraceType `json:"type"`
+
+	NodeName string        `json:"nodename"`
+	FuncName string        `json:"funcname"`
+	Time     time.Time     `json:"time"`
+	Path     string        `json:"path"`
+	Duration time.Duration `json:"dur"`
+	Bytes    int64         `json:"bytes,omitempty"`
+
+	Message         string                  `json:"msg,omitempty"`
+	Error           string                  `json:"error,omitempty"`
+	Custom          map[string]string       `json:"custom,omitempty"`
+	HTTP            *TraceHTTPStats         `json:"http,omitempty"`
+	HealResult      *HealResultItem         `json:"healResult,omitempty"`
+	PurgeOnDeleteOp *TracePurgeOnDeleteInfo `json:"purgeOnDeleteOp,omitempty"`
+}
+
+// Mask returns the trace type as uint32.
+func (t TraceInfo) Mask() uint64 {
+	return t.TraceType.Mask()
+}
+
+type TraceHTTPStats struct {
+	ReqInfo   TraceRequestInfo  `json:"request"`
+	RespInfo  TraceResponseInfo `json:"response"`
+	CallStats TraceCallStats    `json:"stats"`
+}
+
+// TraceCallStats records request stats
+type TraceCallStats struct {
+	InputBytes  int `json:"inputbytes,omitempty"`
+	OutputBytes int `json:"outputbytes,omitempty"`
+
+	// Time from resp read ends until first byte is sent.
+	// If the request had no payload this will be from request received to first response byte.
+	// If no response bytes were sent this will be time until response was done.
+	TimeToFirstByte time.Duration `json:"timetofirstbyte"`
+
+	// Wall time of request and response read/write phase.
+	// Will be 0 if no bytes were read/written.
+	ReqReadTime   time.Duration `json:"reqReadTime,omitempty"`
+	RespWriteTime time.Duration `json:"respWriteTime,omitempty"`
+
+	// Time of request time blocked by upstream reads/writes
+	ReadBlocked  time.Duration `json:"readBlocked,omitempty"`
+	WriteBlocked time.Duration `json:"writeBlocked,omitempty"`
+}
+
+// TraceRequestInfo represents trace of http request
+type TraceRequestInfo struct {
+	Time     time.Time   `json:"time"`
+	Proto    string      `json:"proto"`
+	Method   string      `json:"method"`
+	Path     string      `json:"path,omitempty"`
+	RawQuery string      `json:"rawquery,omitempty"`
+	Headers  http.Header `json:"headers,omitempty"`
+	Body     []byte      `json:"body,omitempty"`
+	Client   string      `json:"client"`
+}
+
+// TraceResponseInfo represents trace of http request
+type TraceResponseInfo struct {
+	Time       time.Time   `json:"time"`
+	Headers    http.Header `json:"headers,omitempty"`
+	Body       []byte      `json:"body,omitempty"`
+	StatusCode int         `json:"statuscode,omitempty"`
+}
+
+// TracePurgeOnDeleteInfo represents information about purge-on-delete operations
+type TracePurgeOnDeleteInfo struct {
+	// Tracking metadata object information
+	TrackerBucket  string `json:"trackerBucket"`
+	TrackerObject  string `json:"trackerObject"`
+	TrackerVersion string `json:"trackerVersion"`
+
+	// Main namespace object information being tracked
+	SourceBucket  string `json:"sourceBucket"`            // Original bucket name
+	SourceObject  string `json:"sourceObject"`            // Original object name/prefix
+	SourceVersion string `json:"sourceVersion,omitempty"` // Original version ID if specific version
+
+	// Operation details
+	Operation       string `json:"operation"`                 // create, update, delete, cleanup, replicate
+	Status          string `json:"status"`                    // pending, in-progress, completed, failed
+	ReplicationSite string `json:"replicationSite,omitempty"` // Site name for cross-site replication
+}
+
+// NewTracePurgeOnDeleteInfo creates a new TracePurgeOnDeleteInfo with basic information
+func NewTracePurgeOnDeleteInfo(trackerBucket, trackerObject, trackerVersion string, sourceBucket, sourceObject string) *TracePurgeOnDeleteInfo {
+	return &TracePurgeOnDeleteInfo{
+		TrackerBucket:  trackerBucket,
+		TrackerObject:  trackerObject,
+		TrackerVersion: trackerVersion,
+		SourceBucket:   sourceBucket,
+		SourceObject:   sourceObject,
+		Status:         "pending",
+	}
+}

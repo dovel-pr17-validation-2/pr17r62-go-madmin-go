@@ -1,0 +1,115 @@
+//
+// Copyright (c) 2015-2025 MinIO, Inc.
+//
+// This file is part of MinIO Object Storage stack
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as
+// published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program. If not, see <http://www.gnu.org/licenses/>.
+//
+
+package madmin
+
+import (
+	"bytes"
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"testing"
+)
+
+// TestSRPeerBucketOpsForwardsCortexOpts verifies that a MakeCortexBktOp peer
+// request forwards the bucket options (versioning, force-create, created-at)
+// alongside the operation, so a cortex is provisioned with the right config on
+// the peer.
+func TestSRPeerBucketOpsForwardsCortexOpts(t *testing.T) {
+	// The handler runs in the server's goroutine; hand the captured query back
+	// over a buffered channel so the read below has a clean happens-before edge
+	// (no shared variable across goroutines).
+	capturedCh := make(chan url.Values, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedCh <- r.URL.Query()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	adm, err := New(server.URL[len("http://"):], "access", "secret", false)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	opts := map[string]string{
+		"versioningEnabled": "true",
+		"forceCreate":       "true",
+		"createdAt":         "2026-01-02T15:04:05Z",
+	}
+	if err := adm.SRPeerBucketOps(context.Background(), "my-cortex", MakeCortexBktOp, opts); err != nil {
+		t.Fatalf("SRPeerBucketOps: %v", err)
+	}
+
+	captured := <-capturedCh
+	if got := captured.Get("operation"); got != string(MakeCortexBktOp) {
+		t.Fatalf("operation: expected %q, got %q", MakeCortexBktOp, got)
+	}
+	for k, want := range opts {
+		if got := captured.Get(k); got != want {
+			t.Fatalf("option %q not forwarded for MakeCortexBktOp: expected %q, got %q", k, want, got)
+		}
+	}
+}
+
+func TestSRSessionPolicy_MarshalUnmarshalJSON(t *testing.T) {
+	tests := []struct {
+		name        string
+		policyBytes []byte
+	}{
+		{
+			name:        "ValidPolicy",
+			policyBytes: []byte(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::example-bucket/*"}]}`),
+		},
+		{
+			name:        "EmptyPolicy",
+			policyBytes: []byte(``),
+		},
+		{
+			name:        "NullPolicy",
+			policyBytes: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Convert policy bytes to SRSessionPolicy
+			policy := SRSessionPolicy(tt.policyBytes)
+
+			// Test MarshalJSON
+			data, err := policy.MarshalJSON()
+			if err != nil {
+				t.Errorf("SRSessionPolicy.MarshalJSON() error = %v", err)
+				return
+			}
+
+			// Test UnmarshalJSON
+			var got SRSessionPolicy
+			if err := got.UnmarshalJSON(data); err != nil {
+				t.Errorf("SRSessionPolicy.UnmarshalJSON() error = %v", err)
+				return
+			}
+
+			// Check if the result matches the original policy
+			if !bytes.Equal(got, tt.policyBytes) {
+				t.Errorf("SRSessionPolicy.UnmarshalJSON() = %s, want %s", got, tt.policyBytes)
+			}
+		})
+	}
+}
